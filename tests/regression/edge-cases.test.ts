@@ -183,4 +183,62 @@ describe('edge cases and boundary conditions', () => {
       expect(mem!.content).toBe(special);
     });
   });
+
+  // ── Empty content validation ────────────────────────────────────────
+
+  describe('empty content validation', () => {
+    it('add rejects empty string', async () => {
+      await expect(provider.add({ content: '', infer: false }))
+        .rejects.toThrow(PowerMemError);
+      await expect(provider.add({ content: '', infer: false }))
+        .rejects.toThrow(/Cannot create memory with empty content/);
+    });
+
+    it('add rejects whitespace-only string', async () => {
+      await expect(provider.add({ content: '   \n\t  ', infer: false }))
+        .rejects.toThrow(PowerMemError);
+    });
+
+    it('update rejects empty string content', async () => {
+      const res = await provider.add({ content: 'valid', infer: false });
+      const id = res.memories[0].id;
+      await expect(provider.update(id, { content: '' }))
+        .rejects.toThrow(PowerMemError);
+      await expect(provider.update(id, { content: '' }))
+        .rejects.toThrow(/Cannot update memory with empty content/);
+    });
+
+    it('update rejects whitespace-only content', async () => {
+      const res = await provider.add({ content: 'valid', infer: false });
+      const id = res.memories[0].id;
+      await expect(provider.update(id, { content: '  \t\n  ' }))
+        .rejects.toThrow(PowerMemError);
+    });
+
+    it('update without content field does not trigger validation', async () => {
+      const res = await provider.add({ content: 'valid', infer: false });
+      const id = res.memories[0].id;
+      const updated = await provider.update(id, { metadata: { key: 'value' } });
+      expect(updated.content).toBe('valid');
+    });
+
+    it('addBatch rejects items with empty content', async () => {
+      await expect(
+        provider.addBatch([
+          { content: 'good' },
+          { content: '' },
+        ])
+      ).rejects.toThrow(PowerMemError);
+    });
+
+    it('update non-existent ID throws PowerMemError with NOT_FOUND code', async () => {
+      try {
+        await provider.update('999999999', { content: 'x' });
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err).toBeInstanceOf(PowerMemError);
+        expect((err as PowerMemError).code).toBe('NOT_FOUND');
+      }
+    });
+  });
 });

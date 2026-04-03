@@ -71,6 +71,15 @@ function ensureParentDir(dbPath: string): void {
   }
 }
 
+function validateContent(content: string, operation: string): void {
+  if (!content || !content.trim()) {
+    throw new PowerMemError(
+      `Cannot ${operation} memory with empty content`,
+      ErrorCode.MEMORY_VALIDATION_ERROR,
+    );
+  }
+}
+
 function toMemoryRecord(rec: VectorStoreRecord): MemoryRecord {
   return {
     id: rec.id,
@@ -449,6 +458,9 @@ export class Memory extends MemoryBase {
   }
 
   private async addInternal(params: AddParams): Promise<AddResult> {
+    if (typeof params.content === 'string') {
+      validateContent(params.content, 'create');
+    }
     const shouldInfer = params.infer !== false && this.llmInstance != null;
     return shouldInfer ? this.intelligentAdd(params) : this.simpleAdd(params);
   }
@@ -649,6 +661,10 @@ export class Memory extends MemoryBase {
     const existing = await this.store.getById(memoryId);
     if (!existing) throw new PowerMemError(`Memory not found: ${memoryId}`, ErrorCode.NOT_FOUND);
 
+    if (params.content !== undefined) {
+      validateContent(params.content, 'update');
+    }
+
     const content = params.content ?? existing.content;
     const metadata = params.metadata ?? existing.metadata;
 
@@ -700,6 +716,9 @@ export class Memory extends MemoryBase {
         ? { content: contentOrParams, ...options }
         : contentOrParams
     );
+    if (typeof params.content === 'string' && (!params.content || !params.content.trim())) {
+      throw new PowerMemError('Cannot create memory with empty content', ErrorCode.MEMORY_VALIDATION_ERROR);
+    }
     try {
       const result = await this.addInternal(params);
       this.logAuditEvent(
@@ -778,6 +797,9 @@ export class Memory extends MemoryBase {
     const params = typeof contentOrParams === 'string'
       ? { content: contentOrParams, ...options }
       : contentOrParams;
+    if (params.content !== undefined && (!params.content || !params.content.trim())) {
+      throw new PowerMemError('Cannot update memory with empty content', ErrorCode.MEMORY_VALIDATION_ERROR);
+    }
     const result = await this.updateInternal(memoryId, params);
     this.logAuditEvent('memory.update', { memoryId }, result.userId, result.agentId);
     return result;
