@@ -8,7 +8,7 @@ import { loadEnvFile } from '../utils/env.js';
 import { autoConfig } from '../config_loader.js';
 import { parseMemoryConfig } from '../configs.js';
 import { GraphStoreFactory, VectorStoreFactory } from '../storage/factory.js';
-import { createEmbeddings, createEmbeddingsFromEnv } from '../integrations/embeddings/factory.js';
+import { createEmbeddings, createEmbeddingsFromEnv, createSparseEmbedder } from '../integrations/embeddings/factory.js';
 import { createLLM, createLLMFromEnv } from '../integrations/llm/factory.js';
 import { createRerankerFnFromConfig } from '../integrations/rerank/factory.js';
 import type { VectorStore, VectorStoreFilter, VectorStoreRecord, GraphStoreBase } from '../storage/base.js';
@@ -36,7 +36,6 @@ import { StorageAdapter } from '../storage/adapter.js';
 import { MemoryOptimizer } from '../intelligence/memory-optimizer.js';
 import { calculateStatsFromMemories } from '../utils/stats.js';
 import { extractTextFromContent, hasVisionContent, hasAudioContent, parseVisionMessages, parseAudioMessages } from '../utils/messages.js';
-import { getDefaultHomeDir } from '../utils/platform.js';
 import { ErrorCode, PowerMemError } from '../errors/index.js';
 import { MemoryBase } from './base.js';
 import { getFactRetrievalPrompt, buildUpdateMemoryPrompt } from '../prompts/intelligent-memory-prompts.js';
@@ -148,30 +147,44 @@ export class Memory extends MemoryBase {
   static async init(_options: Record<string, unknown> = {}): Promise<void> {}
 
   static async create(options: MemoryOptions = {}): Promise<Memory> {
-    loadEnvFile(options.envFile ?? '.env');
+    if (options.envFile) {
+      loadEnvFile(options.envFile);
+    }
 
     const rawConfig = options.config ?? autoConfig();
     const config = parseMemoryConfig(rawConfig);
 
+    let sparseEmbedder: Awaited<ReturnType<typeof createSparseEmbedder>> | undefined;
+    if (config.sparseEmbedder?.provider) {
+      try {
+        sparseEmbedder = await createSparseEmbedder({
+          provider: config.sparseEmbedder.provider,
+          ...(config.sparseEmbedder.config as Record<string, unknown>),
+        } as Parameters<typeof createSparseEmbedder>[0]);
+      } catch {
+        // Sparse embedder stays optional.
+      }
+    }
+
     let store: VectorStore | undefined;
     if (options.store) {
       store = options.store;
-    } else if (options.seekdb) {
-      const { SeekDBStore } = await import('../storage/seekdb/seekdb.js');
-      store = await SeekDBStore.create(options.seekdb);
     } else if (options.dbPath) {
       ensureParentDir(options.dbPath);
       store = new SQLiteStore(options.dbPath);
     } else if (config.vectorStore.provider === 'sqlite') {
       const configuredPath = config.vectorStore.config.path;
-      const dbPath = typeof configuredPath === 'string' ? configuredPath : path.join(getDefaultHomeDir(), 'memories.db');
+      const dbPath = typeof configuredPath === 'string' ? configuredPath : './data/powermem_dev.db';
       ensureParentDir(dbPath);
       store = new SQLiteStore(dbPath);
     } else {
       try {
-        store = await VectorStoreFactory.create(config.vectorStore.provider, config.vectorStore.config);
+        store = await VectorStoreFactory.create(config.vectorStore.provider, {
+          ...(config.vectorStore.config as Record<string, unknown>),
+          ...(sparseEmbedder ? { sparseEmbedder } : {}),
+        });
       } catch {
-        const dbPath = path.join(getDefaultHomeDir(), 'memories.db');
+        const dbPath = './data/powermem_dev.db';
         ensureParentDir(dbPath);
         store = new SQLiteStore(dbPath);
       }
@@ -216,6 +229,7 @@ export class Memory extends MemoryBase {
     if (!reranker && config.reranker) {
       try {
         reranker = await createRerankerFnFromConfig({
+          enabled: config.reranker.enabled,
           provider: config.reranker.provider,
           ...(config.reranker.config as Record<string, unknown>),
         });
@@ -564,13 +578,18 @@ export class Memory extends MemoryBase {
   private async searchInternal(params: SearchParams): Promise<SearchResult> {
     const queryEmbedding = await this.embedder.embed(params.query);
     const filters: VectorStoreFilter = {
+      ...(params.filters ?? {}),
       userId: params.userId,
       agentId: params.agentId,
       runId: params.runId,
     };
     const limit = params.limit ?? 30;
 
-    const searchStore = this.resolveStore({ userId: params.userId, agentId: params.agentId });
+    const searchStore = this.resolveStore({
+      userId: params.userId,
+      agentId: params.agentId,
+      metadata: params.filters,
+    });
     const hybridSearch = (searchStore as VectorStore & {
       hybridSearch?: (
         queryVector: number[],
@@ -590,12 +609,17 @@ export class Memory extends MemoryBase {
     }
 
     if (params.threshold !== undefined) {
-      matches = matches.filter((match) => match.score >= params.threshold!);
+      matches = matches.filter((match) => {
+        const qualityScore = typeof match.metadata?._quality_score === 'number'
+          ? match.metadata._quality_score
+          : match.score;
+        return qualityScore >= params.threshold!;
+      });
     }
 
     const matchIds = matches.map((match) => match.id);
     if (matchIds.length > 0) {
-      await this.store.incrementAccessCountBatch(matchIds);
+      await searchStore.incrementAccessCountBatch(matchIds);
     }
 
     let results: SearchHit[] = matches.map((match) => ({
